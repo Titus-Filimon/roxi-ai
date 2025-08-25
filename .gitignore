@@ -43,3 +43,4 @@ logs/
 # --- Misc ---
 .cache/
 coverage/
+.env
