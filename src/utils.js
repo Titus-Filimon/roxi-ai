@@ -1,5 +1,9 @@
 import { PermissionsBitField } from 'discord.js';
 
+export function parseIdList(envVal) {
+  return (envVal || '').split(',').map(s=>s.trim()).filter(Boolean);
+}
+
 export function log(lvl, obj = {}) {
   console.log(JSON.stringify({ lvl, ts: new Date().toISOString(), ...obj }));
 }
@@ -13,12 +17,17 @@ export function sanitizeInput(text, maxLen = 800) {
   return t;
 }
 
-export async function withTimeout(promise, ms = 9000) {
-  let t;
-  const timer = new Promise((_, rej) => (t = setTimeout(() => rej(new Error('timeout')), ms)));
+// utils.js
+export async function withTimeout(promise, ms = 30000) { // 30s
+  let t; const timer = new Promise((_, rej) => (t = setTimeout(() => rej(new Error('timeout')), ms)));
   try { return await Promise.race([promise, timer]); }
   finally { clearTimeout(t); }
 }
+
+export async function onceWithRetry(fn) {
+  try { return await fn(); } catch (_) { return await fn(); }
+}
+
 
 export function rollProbability(p = 0.33) {
   return Math.random() < p;

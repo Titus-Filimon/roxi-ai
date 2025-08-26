@@ -21,11 +21,14 @@ export function recordActivity(channelId, uid, ts, options) {
   return pruned;
 }
 
-export function windowStats(channelId) {
+export function windowStats(channelId, opts) {
   const arr = activityWindow.get(channelId) || [];
   const speakers = speakerSet.get(channelId) || new Set();
-  return { count: arr.length, speakers: speakers.size };
+  const result = { count: arr.length, speakers: speakers.size };
+  if (opts?.withSet) result.speakersSet = new Set(speakers);
+  return result;
 }
+
 
 export function channelIsActive(channelId, options) {
   const { count, speakers } = windowStats(channelId);
