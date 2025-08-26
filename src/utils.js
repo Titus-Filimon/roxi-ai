@@ -18,7 +18,7 @@ export function sanitizeInput(text, maxLen = 800) {
 }
 
 // utils.js
-export async function withTimeout(promise, ms = 30000) { // 30s
+export async function withTimeout(promise, ms = 40000) { // 30s
   let t; const timer = new Promise((_, rej) => (t = setTimeout(() => rej(new Error('timeout')), ms)));
   try { return await Promise.race([promise, timer]); }
   finally { clearTimeout(t); }

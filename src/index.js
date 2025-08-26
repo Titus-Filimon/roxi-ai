@@ -24,7 +24,7 @@ import {
   canSendInChannel,
 } from './utils.js';
 
-import { parseIdList } from './utils.js';
+import { parseIdList, onceWithRetry } from './utils.js';
 
 
 /* ========== Config (env) ========== */
@@ -121,6 +121,23 @@ const client = new Client({
 
 
 client.once(Events.ClientReady, async () => {
+    setTimeout(async () => {
+      try {
+        const warm = await withTimeout(
+          onceWithRetry(() => generateReply({
+            channel: '#warmup',
+            recent: { messages: [{ author:'You', content:'say hi', ts: Date.now(), isBot:false }] },
+            mode: MODE
+          })),
+          40000
+        );
+        log('info', { evt: 'warmup_done', ok: !!warm, bytes: (warm||'').length });
+      } catch (e) {
+        log('warn', { evt: 'warmup_fail', err: e?.message });
+      }
+    }, 1500);
+
+
   log('info', {
     msg: `Roxi online as ${client.user.tag}`,
     mode: MODE,
@@ -190,7 +207,7 @@ function startProactiveTicker() {
               recent: { messages: trimmed, ...windowStats(channel.id), momentum: MOMENTUM_LOOKBACK_MIN },
               mode: MODE,
             })),
-            30000
+            40000
           );
 
           if (reply && reply.trim()) {
