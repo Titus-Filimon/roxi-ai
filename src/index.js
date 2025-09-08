@@ -1,14 +1,9 @@
 import 'dotenv/config';
-import {
-  Client,
-  GatewayIntentBits,
-  Partials,
-  Events,
-} from 'discord.js';
+import { Client, GatewayIntentBits, Partials, Events } from 'discord.js';
 import http from 'node:http';
 
 import { handleTextCommand } from './commands.js';
-import { generateReply } from './ai.js';
+import { generateReply, warmup, aiHealth } from './ai.js';
 import {
   recordActivity,
   windowStats,
@@ -22,10 +17,9 @@ import {
   withTimeout,
   rollProbability,
   canSendInChannel,
+  parseIdList,
+  onceWithRetry,
 } from './utils.js';
-
-import { parseIdList, onceWithRetry } from './utils.js';
-
 
 /* ========== Config (env) ========== */
 const TOKEN = process.env.DISCORD_TOKEN;
@@ -59,14 +53,20 @@ const PROACTIVE_INTERVAL_MS = Number(process.env.ROXI_PROACTIVE_INTERVAL_MS || 9
 const PROACTIVE_PROBABILITY = Number(process.env.ROXI_PROACTIVE_PROBABILITY || 0.15);
 const KEYWORD = (process.env.ROXI_KEYWORD || 'roxi').toLowerCase();
 
+// Warm-up
+const WARMUP_ENABLED   = (process.env.ROXI_WARMUP_ENABLED ?? '1') === '1';
+const WARMUP_DELAY_MS  = Number(process.env.ROXI_WARMUP_DELAY_MS || 1500);
+const WARMUP_INTERVAL  = Number(process.env.ROXI_WARMUP_INTERVAL_MIN || 15) * 60 * 1000;
+
+/* ========== State ========== */
+let HARD_MUTE = process.env.ROXI_MUTE === '1';
+const lastReplyPerChannel = new Map(); // channelId -> ts
+const inFlight = new Map();            // channelId -> boolean
+let warmupInFlight = false;
 
 // Optional channel allowlist (leave empty for all)
 const ALLOWED_CHANNELS = (process.env.ROXI_CHANNELS || '')
   .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
-
-/* ========== Mutable state ========== */
-let HARD_MUTE = process.env.ROXI_MUTE === '1';
-const lastReplyPerChannel = new Map(); // channelId -> ts
 
 /* ========== Helpers ========== */
 function allowedByChannelList(channel) {
@@ -99,12 +99,35 @@ function conversationEligible(channel) {
 
 async function maybeAnnounceWake(channel) {
   if (!WAKE_MSG_ENABLED) return;
-  // If this is among the first messages after a long sleep, say hi once
   const last = lastHumanActivity.get(channel.id) || 0;
   const justNow = Date.now() - last <= WAKE_ANNOUNCE_SEC * 1000;
-  if (justNow) {
-    try { await channel.send("☀️ I'm awake! What's going on?"); } catch {}
+  if (justNow) { try { await channel.send("☀️ I'm awake! What's going on?"); } catch {} }
+}
+
+async function withChannelLock(channelId, fn) {
+  if (inFlight.get(channelId)) return;
+  inFlight.set(channelId, true);
+  try { return await fn(); }
+  finally { inFlight.delete(channelId); }
+}
+
+/* ========== Presence helpers ========== */
+const coreOnlineByGuild = new Map(); // guildId -> Set(userId) of online core users
+
+function updateCorePresence(guild) {
+  if (!guild?.members?.cache) return;
+  const set = new Set();
+  for (const uid of CORE_USER_IDS) {
+    const m = guild.members.cache.get(uid);
+    const status = m?.presence?.status || 'offline';
+    if (status !== 'offline' && status !== 'invisible') set.add(uid);
   }
+  coreOnlineByGuild.set(guild.id, set);
+  return set;
+}
+function anyCoreOnline(guild) {
+  const set = coreOnlineByGuild.get(guild.id) || new Set();
+  return set.size > 0;
 }
 
 /* ========== Discord client ========== */
@@ -113,31 +136,13 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
-    GatewayIntentBits.GuildMembers,     
-    GatewayIntentBits.GuildPresences,   
+    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.GuildPresences,
   ],
   partials: [Partials.Channel],
 });
 
-
 client.once(Events.ClientReady, async () => {
-    setTimeout(async () => {
-      try {
-        const warm = await withTimeout(
-          onceWithRetry(() => generateReply({
-            channel: '#warmup',
-            recent: { messages: [{ author:'You', content:'say hi', ts: Date.now(), isBot:false }] },
-            mode: MODE
-          })),
-          40000
-        );
-        log('info', { evt: 'warmup_done', ok: !!warm, bytes: (warm||'').length });
-      } catch (e) {
-        log('warn', { evt: 'warmup_fail', err: e?.message });
-      }
-    }, 1500);
-
-
   log('info', {
     msg: `Roxi online as ${client.user.tag}`,
     mode: MODE,
@@ -154,24 +159,58 @@ client.once(Events.ClientReady, async () => {
     },
     allowChannels: ALLOWED_CHANNELS.length ? ALLOWED_CHANNELS : 'ALL',
   });
+
   try {
     for (const g of client.guilds.cache.values()) {
       await g.members.fetch({ withPresences: true }).catch(()=>{});
       updateCorePresence(g);
     }
   } catch {}
+
+  // Warmup sequence
+  if (WARMUP_ENABLED) {
+    setTimeout(async () => {
+      if (warmupInFlight) return;
+      warmupInFlight = true;
+      try {
+        const okHealth = await aiHealth();
+        log('info', { evt: 'ai_health', ok: okHealth });
+        const ok = await withTimeout(onceWithRetry(() => warmup()), 26000);
+        log('info', { evt: 'warmup_done', ok });
+      } catch (e) {
+        log('warn', { evt: 'warmup_fail', err: e?.message });
+      } finally {
+        warmupInFlight = false;
+      }
+    }, WARMUP_DELAY_MS);
+
+    if (WARMUP_INTERVAL > 0) {
+      setInterval(async () => {
+        if (warmupInFlight) return;
+        warmupInFlight = true;
+        try {
+          const ok = await withTimeout(onceWithRetry(() => warmup()), 26000);
+          log('info', { evt: 'warmup_keepalive', ok });
+        } catch (e) {
+          log('warn', { evt: 'warmup_keepalive_fail', err: e?.message });
+        } finally {
+          warmupInFlight = false;
+        }
+      }, WARMUP_INTERVAL);
+    }
+  }
+
+  startProactiveTicker();
 });
 
-// Ticker
+/* ========== Proactive ticker ========== */
 function eligibleChannelsForProactive(guild) {
   const channels = [];
   for (const ch of guild.channels.cache.values()) {
-    // text channels only, skip threads; you can refine this if you want threads
     if (ch?.isTextBased?.() && !ch.isThread?.()) {
-      // reuse your existing gates
       const lastUserTs = lastHumanActivity.get(ch.id) || 0;
       if (!canEvenConsiderSpeaking(ch, lastUserTs)) continue;
-      if (!conversationEligible(ch)) continue;           // momentum + speakers
+      if (!conversationEligible(ch)) continue;
       if (!canSendInChannel(ch, client.user)) continue;
       channels.push(ch);
     }
@@ -184,12 +223,11 @@ function startProactiveTicker() {
   setInterval(async () => {
     try {
       for (const guild of client.guilds.cache.values()) {
-        if (!anyCoreOnline(guild)) continue; // only when a core member is online
+        if (!anyCoreOnline(guild)) continue;
         const chans = eligibleChannelsForProactive(guild);
         for (const ch of chans) {
           if (Math.random() > PROACTIVE_PROBABILITY) continue;
 
-          // fetch brief context
           const history = await ch.messages.fetch({ limit: Math.min(50, MAX_CONTEXT_MSGS) }).catch(() => null);
           const sorted = history ? [...history.values()].sort((a,b)=>a.createdTimestamp-b.createdTimestamp) : [];
           const trimmed = sorted.slice(-MAX_CONTEXT_MSGS).map(m => ({
@@ -201,20 +239,31 @@ function startProactiveTicker() {
 
           if (trimmed.length === 0) continue;
 
-          const reply = await withTimeout(
-            onceWithRetry(() => generateReply({
-              channel: `#${channelName}`,
-              recent: { messages: trimmed, ...windowStats(channel.id), momentum: MOMENTUM_LOOKBACK_MIN },
-              mode: MODE,
-            })),
-            40000
-          );
+          await withChannelLock(ch.id, async () => {
+            let typing = true;
+            const pump = setInterval(() => { if (typing) ch.sendTyping().catch(()=>{}); }, 4000);
+            ch.sendTyping().catch(()=>{});
 
-          if (reply && reply.trim()) {
-            await ch.send(reply.trim());
-            lastReplyPerChannel.set(ch.id, Date.now());
-            log('info', { evt: 'send', reason: 'proactive', channel: ch.name });
-          }
+            try {
+              const reply = await withTimeout(
+                onceWithRetry(() => generateReply({
+                  channel: `#${ch.name}`,
+                  recent: { messages: trimmed, ...windowStats(ch.id), momentum: MOMENTUM_LOOKBACK_MIN },
+                  mode: MODE,
+                })),
+                26000
+              );
+
+              if (reply && reply.trim()) {
+                await ch.send(reply.trim());
+                lastReplyPerChannel.set(ch.id, Date.now());
+                log('info', { evt: 'send', reason: 'proactive', channel: ch.name });
+              }
+            } finally {
+              typing = false;
+              clearInterval(pump);
+            }
+          });
         }
       }
     } catch (e) {
@@ -223,48 +272,23 @@ function startProactiveTicker() {
   }, PROACTIVE_INTERVAL_MS);
 }
 
-client.once(Events.ClientReady, () => {
-  // ... existing log/init
-  startProactiveTicker();
+/* ========== Presence events ========== */
+client.on(Events.PresenceUpdate, (_, newPresence) => {
+  try { updateCorePresence(newPresence?.guild); } catch {}
 });
+client.on(Events.GuildCreate, (g) => { try { updateCorePresence(g); } catch {} });
+client.on(Events.GuildMemberAdd, (m) => { try { updateCorePresence(m.guild); } catch {} });
 
-const coreOnlineByGuild = new Map(); // guildId -> Set(userId) of online core users
-
-function updateCorePresence(guild) {
-  if (!guild?.members?.cache) return;
-  const set = new Set();
-  for (const uid of CORE_USER_IDS) {
-    const m = guild.members.cache.get(uid);
-    const status = m?.presence?.status || 'offline'; // 'online'|'idle'|'dnd'|'offline'
-    if (status !== 'offline' && status !== 'invisible') set.add(uid);
-  }
-  coreOnlineByGuild.set(guild.id, set);
-  return set;
-}
-function anyCoreOnline(guild) {
-  const set = coreOnlineByGuild.get(guild.id) || new Set();
-  return set.size > 0;
-}
-
-
-/* ========== Commands (admin text) ========== */
-async function handleAdminCommands(msg) {
+/* ========== Commands wrapper ========== */
+async function handleAdmin(msg) {
   const res = await handleTextCommand(msg, { HARD_MUTE });
-  if (res === false) return false;          // no command handled
-  if (res === true) return true;            // handled, no state change
-  if (res?.HARD_MUTE !== undefined) {       // handled + state change
-    HARD_MUTE = res.HARD_MUTE;
-    return true;
-  }
+  if (res === false) return false;
+  if (res === true) return true;
+  if (res?.HARD_MUTE !== undefined) { HARD_MUTE = res.HARD_MUTE; return true; }
   return false;
 }
 
 /* ========== Main message handler ========== */
-client.on(Events.PresenceUpdate, (_, newPresence) => {
-  try { updateCorePresence(newPresence?.guild); } catch {}});
-client.on(Events.GuildCreate, (g) => { try { updateCorePresence(g); } catch {} });
-client.on(Events.GuildMemberAdd, (m) => { try { updateCorePresence(m.guild); } catch {} });
-
 client.on(Events.MessageCreate, async (msg) => {
   try {
     if (msg.author.bot || !msg.inGuild()) return;
@@ -272,16 +296,12 @@ client.on(Events.MessageCreate, async (msg) => {
     const channel = msg.channel;
     const channelName = channel?.name || '(unknown)';
 
-    // Commands first (admin-only)
-    if (await handleAdminCommands(msg)) return;
+    if (await handleAdmin(msg)) return;
 
-    // Track activity window and last human activity
-    recordActivity(channel.id, msg.author.id, msg.createdTimestamp, {
-      MOMENTUM_LOOKBACK_MIN,
-    });
+    // Activity tracking
+    recordActivity(channel.id, msg.author.id, msg.createdTimestamp, { MOMENTUM_LOOKBACK_MIN });
     lastHumanActivity.set(channel.id, msg.createdTimestamp);
 
-    // If we just woke up (first messages after a long sleep), optionally say hi
     if (!isChannelSleeping(channel.id, { SLEEP_AFTER_MIN })) {
       await maybeAnnounceWake(channel);
     }
@@ -291,7 +311,6 @@ client.on(Events.MessageCreate, async (msg) => {
     const mentioned = msg.mentions.has(client.user);
     const keywordTrigger = KEYWORD && content.includes(KEYWORD);
 
-    // If mentioned or keyword, bypass momentum but still respect cooldown + sleep + channel allowlist
     if (mentioned || keywordTrigger) {
       const lastUserTs = lastHumanActivity.get(channel.id) || msg.createdTimestamp;
       if (!canEvenConsiderSpeaking(channel, lastUserTs)) return;
@@ -306,25 +325,39 @@ client.on(Events.MessageCreate, async (msg) => {
         isBot: m.author.bot,
       })).filter(m => m.content || !m.isBot);
 
-      const reply = await withTimeout(generateReply({
-        channel: `#${channelName}`,
-        recent: {
-          messages: trimmed,
-          ...windowStats(channel.id),
-          momentum: MOMENTUM_LOOKBACK_MIN,
-        },
-        mode: MODE,
-      }), 9000);
+      await withChannelLock(channel.id, async () => {
+        let typing = true;
+        const pump = setInterval(() => { if (typing) channel.sendTyping().catch(()=>{}); }, 4000);
+        channel.sendTyping().catch(()=>{});
 
-      if (reply && reply.trim()) {
-        await channel.send(reply.trim());
-        lastReplyPerChannel.set(channel.id, Date.now());
-        log('info', { evt: 'send', reason: mentioned ? 'mention' : 'keyword', channel: channelName });
-      }
-      return; // don’t also run the organic path
+        try {
+          const reply = await withTimeout(
+            onceWithRetry(() => generateReply({
+              channel: `#${channelName}`,
+              recent: {
+                messages: trimmed,
+                ...windowStats(channel.id),
+                momentum: MOMENTUM_LOOKBACK_MIN,
+              },
+              mode: MODE,
+            })),
+            26000
+          );
+
+          if (reply && reply.trim()) {
+            await channel.send(reply.trim());
+            lastReplyPerChannel.set(channel.id, Date.now());
+            log('info', { evt: 'send', reason: mentioned ? 'mention' : 'keyword', channel: channelName });
+          }
+        } finally {
+          typing = false;
+          clearInterval(pump);
+        }
+      });
+      return;
     }
 
-    // Global gates
+    // ===== Organic path =====
     const lastUserTs = lastHumanActivity.get(channel.id) || msg.createdTimestamp;
     if (!canEvenConsiderSpeaking(channel, lastUserTs)) return;
     if (!conversationEligible(channel)) return;
@@ -332,7 +365,6 @@ client.on(Events.MessageCreate, async (msg) => {
       log('warn', { evt: 'no_send_perm', channel: channelName }); return;
     }
 
-    // Build recent context
     const history = await channel.messages.fetch({ limit: Math.min(50, MAX_CONTEXT_MSGS) }).catch(() => null);
     const sorted = history ? [...history.values()].sort((a,b)=>a.createdTimestamp-b.createdTimestamp) : [];
     const trimmed = sorted.slice(-MAX_CONTEXT_MSGS).map(m => ({
@@ -343,37 +375,43 @@ client.on(Events.MessageCreate, async (msg) => {
     })).filter(m => m.content || !m.isBot);
 
     if (trimmed.length === 0) return;
-
-    // Final randomness
     if (!rollProbability(REPLY_PROBABILITY)) return;
 
-    // AI (swap in your LLM/RAG inside generateReply)
-    const reply = await withTimeout(generateReply({
-      channel: `#${channelName}`,
-      recent: {
-        messages: trimmed,
-        ...windowStats(channel.id),
-        momentum: MOMENTUM_LOOKBACK_MIN,
-      },
-      mode: MODE,
-    }), 9000);
+    await withChannelLock(channel.id, async () => {
+      let typing = true;
+      const pump = setInterval(() => { if (typing) channel.sendTyping().catch(()=>{}); }, 4000);
+      channel.sendTyping().catch(()=>{});
 
-    if (reply && reply.trim()) {
-      await channel.send(reply.trim());
-      lastReplyPerChannel.set(channel.id, Date.now());
-      log('info', {
-        evt: 'send',
-        channel: channelName,
-        bytes: reply.length,
-        recentMsgs: trimmed.length
-      });
-    }
+      try {
+        const reply = await withTimeout(
+          onceWithRetry(() => generateReply({
+            channel: `#${channelName}`,
+            recent: {
+              messages: trimmed,
+              ...windowStats(channel.id),
+              momentum: MOMENTUM_LOOKBACK_MIN,
+            },
+            mode: MODE,
+          })),
+          26000
+        );
+
+        if (reply && reply.trim()) {
+          await channel.send(reply.trim());
+          lastReplyPerChannel.set(channel.id, Date.now());
+          log('info', { evt: 'send', channel: channelName, bytes: reply.length, recentMsgs: trimmed.length });
+        }
+      } finally {
+        typing = false;
+        clearInterval(pump);
+      }
+    });
   } catch (err) {
     log('error', { evt: 'handler_error', err: err?.message || String(err) });
   }
 });
 
-/* ========== Health endpoint (optional) ========== */
+/* ========== Health endpoint ========== */
 if (STATUS_PORT > 0) {
   const server = http.createServer((req, res) => {
     if (req.url === '/status') {

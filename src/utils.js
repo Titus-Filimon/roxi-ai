@@ -17,9 +17,9 @@ export function sanitizeInput(text, maxLen = 800) {
   return t;
 }
 
-// utils.js
-export async function withTimeout(promise, ms = 40000) { // 30s
-  let t; const timer = new Promise((_, rej) => (t = setTimeout(() => rej(new Error('timeout')), ms)));
+export async function withTimeout(promise, ms = 26000) {
+  let t;
+  const timer = new Promise((_, rej) => (t = setTimeout(() => rej(new Error('timeout')), ms)));
   try { return await Promise.race([promise, timer]); }
   finally { clearTimeout(t); }
 }
@@ -27,7 +27,6 @@ export async function withTimeout(promise, ms = 40000) { // 30s
 export async function onceWithRetry(fn) {
   try { return await fn(); } catch (_) { return await fn(); }
 }
-
 
 export function rollProbability(p = 0.33) {
   return Math.random() < p;

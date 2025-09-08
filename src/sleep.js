@@ -29,7 +29,6 @@ export function windowStats(channelId, opts) {
   return result;
 }
 
-
 export function channelIsActive(channelId, options) {
   const { count, speakers } = windowStats(channelId);
   const needMsgs = count >= (options?.MOMENTUM_MIN_MSGS ?? 10);
