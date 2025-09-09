@@ -58,11 +58,18 @@ const WARMUP_ENABLED   = (process.env.ROXI_WARMUP_ENABLED ?? '1') === '1';
 const WARMUP_DELAY_MS  = Number(process.env.ROXI_WARMUP_DELAY_MS || 1500);
 const WARMUP_INTERVAL  = Number(process.env.ROXI_WARMUP_INTERVAL_MIN || 15) * 60 * 1000;
 
+// Linger window (no re-mention needed)
+const LINGER_MS = Number(process.env.ROXI_LINGER_MS || 120000); // 2 minutes
+
 /* ========== State ========== */
 let HARD_MUTE = process.env.ROXI_MUTE === '1';
 const lastReplyPerChannel = new Map(); // channelId -> ts
 const inFlight = new Map();            // channelId -> boolean
 let warmupInFlight = false;
+
+// Conversational state
+const recentEngagement = new Map();            // channelId -> timestamp of last engagement window start
+const lastRoxiMsgIdPerChannel = new Map();     // channelId -> last sent message id
 
 // Optional channel allowlist (leave empty for all)
 const ALLOWED_CHANNELS = (process.env.ROXI_CHANNELS || '')
@@ -255,8 +262,10 @@ function startProactiveTicker() {
               );
 
               if (reply && reply.trim()) {
-                await ch.send(reply.trim());
+                const sent = await ch.send(reply.trim());
                 lastReplyPerChannel.set(ch.id, Date.now());
+                recentEngagement.set(ch.id, Date.now());
+                lastRoxiMsgIdPerChannel.set(ch.id, sent.id);
                 log('info', { evt: 'send', reason: 'proactive', channel: ch.name });
               }
             } finally {
@@ -302,16 +311,31 @@ client.on(Events.MessageCreate, async (msg) => {
     recordActivity(channel.id, msg.author.id, msg.createdTimestamp, { MOMENTUM_LOOKBACK_MIN });
     lastHumanActivity.set(channel.id, msg.createdTimestamp);
 
+    // If someone speaks within 10s after Roxi, extend linger window
+    const lastRoxi = lastReplyPerChannel.get(channel.id) || 0;
+    if (Date.now() - lastRoxi < 10000) {
+      recentEngagement.set(channel.id, Date.now());
+    }
+
     if (!isChannelSleeping(channel.id, { SLEEP_AFTER_MIN })) {
       await maybeAnnounceWake(channel);
     }
 
-    // ===== Immediate trigger detection =====
+    // ===== Directed-to-Roxi detection =====
     const content = (msg.cleanContent || '').toLowerCase();
     const mentioned = msg.mentions.has(client.user);
     const keywordTrigger = KEYWORD && content.includes(KEYWORD);
 
-    if (mentioned || keywordTrigger) {
+    const isReplyToRoxi = Boolean(
+      msg.reference?.messageId &&
+      lastRoxiMsgIdPerChannel.get(channel.id) === msg.reference.messageId
+    );
+    const lastEngaged = recentEngagement.get(channel.id) || 0;
+    const withinLinger = (Date.now() - lastEngaged) < LINGER_MS;
+
+    const directedToRoxi = mentioned || keywordTrigger || isReplyToRoxi || withinLinger;
+
+    if (directedToRoxi) {
       const lastUserTs = lastHumanActivity.get(channel.id) || msg.createdTimestamp;
       if (!canEvenConsiderSpeaking(channel, lastUserTs)) return;
       if (!canSendInChannel(channel, client.user)) return;
@@ -345,9 +369,11 @@ client.on(Events.MessageCreate, async (msg) => {
           );
 
           if (reply && reply.trim()) {
-            await channel.send(reply.trim());
+            const sent = await channel.send(reply.trim());
             lastReplyPerChannel.set(channel.id, Date.now());
-            log('info', { evt: 'send', reason: mentioned ? 'mention' : 'keyword', channel: channelName });
+            recentEngagement.set(channel.id, Date.now());
+            lastRoxiMsgIdPerChannel.set(channel.id, sent.id);
+            log('info', { evt: 'send', reason: (isReplyToRoxi ? 'reply' : (mentioned ? 'mention' : (keywordTrigger ? 'keyword' : 'linger'))), channel: channelName });
           }
         } finally {
           typing = false;
@@ -397,8 +423,10 @@ client.on(Events.MessageCreate, async (msg) => {
         );
 
         if (reply && reply.trim()) {
-          await channel.send(reply.trim());
+          const sent = await channel.send(reply.trim());
           lastReplyPerChannel.set(channel.id, Date.now());
+          recentEngagement.set(channel.id, Date.now());
+          lastRoxiMsgIdPerChannel.set(channel.id, sent.id);
           log('info', { evt: 'send', channel: channelName, bytes: reply.length, recentMsgs: trimmed.length });
         }
       } finally {
